@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::ops::Mul;
+use std::path::Path;
 use std::path::PathBuf;
 
 const MODEL: &str = "qwen3.8:27b";
@@ -117,6 +118,21 @@ fn tools() -> Value {
                     "required": ["path"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Create or overwrite a text file in the workspace with the given content. To change an existing file, read it first, then write the COMPLETE new content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "file path relative to the workspace, e.g. 'todo.txt'" },
+                        "content": { "type": "string", "description": "the full new content of the file" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
         }
     ])
 }
@@ -126,6 +142,7 @@ fn run_tool(call: &FunctionCall) -> String {
         "multiply" => tool_multiply(&call.arguments),
         "list_files" => tool_list_files(),
         "read_file" => tool_read_file(&call.arguments),
+        "write_file" => tool_write_file(&call.arguments),
         _ => Err(format!("unknown tool: {}", call.name)),
     };
     match result {
@@ -194,6 +211,36 @@ fn tool_read_file(args: &Value) -> Result<String, String> {
     Ok(content)
 }
 
+fn tool_write_file(args: &Value) -> Result<String, String> {
+    let (Some(requested), Some(content)) = (args["path"].as_str(), args["content"].as_str()) else {
+        return Err(format!(
+            "write_file needs strings 'path' and 'content', got {args}"
+        ));
+    };
+
+    let path = safe_write_path(requested)?;
+
+    let action = if path.exists() { "OVERWRITE" } else { "CREATE" };
+    println!("\n--- {action} {requested} ---");
+    let preview: String = content.chars().take(500).collect();
+    println!("{preview}");
+    if content.chars().count() > 500 {
+        println!("... ({} characters total)", content.chars().count());
+    }
+    println!("---");
+
+    if !confirm("Allow this write?") {
+        return Err("the user denied this write".to_string());
+    }
+
+    std::fs::write(&path, content).map_err(|e| format!("cannot write '{requested}': {e}"))?;
+
+    Ok(format!(
+        "wrote {} characters to '{requested}'",
+        content.chars().count()
+    ))
+}
+
 fn send(
     client: &reqwest::blocking::Client,
     history: &[Message],
@@ -258,11 +305,46 @@ fn safe_path(requested: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn safe_write_path(requested: &str) -> Result<PathBuf, String> {
+    let workspace = std::fs::canonicalize(WORKSPACE).map_err(|e| e.to_string())?;
+    let requested_path = Path::new(requested);
+
+    let file_name = requested_path
+        .file_name()
+        .ok_or(format!("'{requested}' is not a valid file path"))?;
+    let parent = requested_path.parent().unwrap_or(Path::new(""));
+    let folder = std::fs::canonicalize(workspace.join(parent))
+        .map_err(|e| format!("folder for '{requested}' does not exist: {e}"))?;
+
+    if !folder.starts_with(&workspace) {
+        return Err("access denied: path is outside the workspace".to_string());
+    }
+
+    let path = folder.join(file_name);
+
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!("access denied: '{requested}' is a symlink"));
+    }
+    Ok(path)
+}
+
+fn confirm(question: &str) -> bool {
+    print!("{question} [y/N] ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    answer.trim().eq_ignore_ascii_case("y")
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder().timeout(None).build()?;
 
     let mut history: Vec<Message> = vec![];
-    history.push(Message::system("You are a helpful, concise assistant. You can read files in the user's workspace with your tools"));
+    history.push(Message::system("You are a helpful, concise assistant. You can list, read and write files in the user's workspace with your tools"));
 
     loop {
         print!("you> ");
