@@ -138,11 +138,14 @@ fn tools() -> Value {
 }
 
 fn run_tool(call: &FunctionCall) -> String {
+    // The real program uses the real workspace folder and asks the real user.
+    // Tests call the tool functions directly with a temp folder and a fake confirm.
+    let workspace = Path::new(WORKSPACE);
     let result = match call.name.as_str() {
         "multiply" => tool_multiply(&call.arguments),
-        "list_files" => tool_list_files(),
-        "read_file" => tool_read_file(&call.arguments),
-        "write_file" => tool_write_file(&call.arguments),
+        "list_files" => tool_list_files(workspace),
+        "read_file" => tool_read_file(workspace, &call.arguments),
+        "write_file" => tool_write_file(workspace, &call.arguments, confirm),
         _ => Err(format!("unknown tool: {}", call.name)),
     };
     match result {
@@ -165,8 +168,8 @@ where
     a * b
 }
 
-fn tool_list_files() -> Result<String, String> {
-    let entries = std::fs::read_dir(WORKSPACE).map_err(|e| e.to_string())?;
+fn tool_list_files(workspace: &Path) -> Result<String, String> {
+    let entries = std::fs::read_dir(workspace).map_err(|e| e.to_string())?;
     let mut names: Vec<String> = Vec::new();
 
     for entry in entries {
@@ -187,11 +190,11 @@ fn tool_list_files() -> Result<String, String> {
 
     Ok(names.join("\n"))
 }
-fn tool_read_file(args: &Value) -> Result<String, String> {
+fn tool_read_file(workspace: &Path, args: &Value) -> Result<String, String> {
     let requested = args["path"]
         .as_str()
         .ok_or(format!("read_file needs a string 'path', got {args}"))?;
-    let path = safe_path(requested)?;
+    let path = safe_path(workspace, requested)?;
 
     if !path.is_file() {
         return Err(format!(
@@ -211,14 +214,22 @@ fn tool_read_file(args: &Value) -> Result<String, String> {
     Ok(content)
 }
 
-fn tool_write_file(args: &Value) -> Result<String, String> {
+// `confirm` is a parameter: "any function that takes a question and returns yes/no".
+// The real program passes the `confirm` function below (asks in the terminal);
+// tests pass a closure like `|_| true` or `|_| false`.
+// Inside this function, the name `confirm` means the parameter, not the global fn.
+fn tool_write_file(
+    workspace: &Path,
+    args: &Value,
+    confirm: impl Fn(&str) -> bool,
+) -> Result<String, String> {
     let (Some(requested), Some(content)) = (args["path"].as_str(), args["content"].as_str()) else {
         return Err(format!(
             "write_file needs strings 'path' and 'content', got {args}"
         ));
     };
 
-    let path = safe_write_path(requested)?;
+    let path = safe_write_path(workspace, requested)?;
 
     let action = if path.exists() { "OVERWRITE" } else { "CREATE" };
     println!("\n--- {action} {requested} ---");
@@ -293,8 +304,8 @@ fn agent_turn(
     Ok(())
 }
 
-fn safe_path(requested: &str) -> Result<PathBuf, String> {
-    let workspace = std::fs::canonicalize(WORKSPACE).map_err(|e| e.to_string())?;
+fn safe_path(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
+    let workspace = std::fs::canonicalize(workspace).map_err(|e| e.to_string())?;
 
     let path = std::fs::canonicalize(workspace.join(requested))
         .map_err(|e| format!("cannot open '{requested}': {e}"))?;
@@ -305,8 +316,8 @@ fn safe_path(requested: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn safe_write_path(requested: &str) -> Result<PathBuf, String> {
-    let workspace = std::fs::canonicalize(WORKSPACE).map_err(|e| e.to_string())?;
+fn safe_write_path(workspace: &Path, requested: &str) -> Result<PathBuf, String> {
+    let workspace = std::fs::canonicalize(workspace).map_err(|e| e.to_string())?;
     let requested_path = Path::new(requested);
 
     let file_name = requested_path
@@ -370,4 +381,223 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+
+        fs::create_dir(&ws).unwrap();
+        fs::create_dir(ws.join("notes")).unwrap();
+        fs::write(ws.join("todo.txt"), "buy milk").unwrap();
+        fs::write(tmp.path().join("secret.txt"), "TOP SECRET").unwrap();
+
+        std::os::unix::fs::symlink("../secret.txt", ws.join("link.txt")).unwrap();
+
+        (tmp, ws)
+    }
+
+    #[test]
+    fn multiply_works() {
+        let result = tool_multiply(&json!({"a": 6, "b": 7}));
+        assert_eq!(result, Ok("42".to_string()));
+    }
+
+    // --- safe_path (reading) ---
+    #[test]
+    fn read_allows_file_in_workspace() {
+        let (_tmp, ws) = setup();
+        assert!(safe_path(&ws, "todo.txt").is_ok());
+    }
+
+    #[test]
+    fn read_blocks_parent_dir() {
+        let (_tmp, ws) = setup();
+
+        let err = safe_path(&ws, "../secret.txt").unwrap_err();
+        assert!(
+            err.contains("access denied: path is outside the workspace"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_blocks_absolute_path() {
+        let (_tmp, ws) = setup();
+        let err = safe_path(&ws, "/etc/hosts").unwrap_err();
+        assert!(
+            err.contains("access denied: path is outside the workspace"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_blocks_sneaky_dotdot() {
+        let (_tmp, ws) = setup();
+        let err = safe_path(&ws, "notes/../../secret.txt").unwrap_err();
+        assert!(
+            err.contains("access denied: path is outside the workspace"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_fails_for_missing_file() {
+        let (_tmp, ws) = setup();
+        let err = safe_path(&ws, "does-not-exist.txt").unwrap_err();
+        assert!(
+            err.contains("cannot open 'does-not-exist.txt': "),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_blocks_symlink_pointing_outside() {
+        let (_tmp, ws) = setup();
+        let err = safe_path(&ws, "link.txt").unwrap_err();
+        assert!(
+            err.contains("access denied: path is outside the workspace"),
+            "wrong error: {err}"
+        );
+    }
+
+    // --- safe_write_path (writing) ---
+    #[test]
+    fn write_allows_new_file() {
+        let (_tmp, ws) = setup();
+        let path = safe_write_path(&ws, "new.txt").unwrap();
+        // Compare with the canonical workspace: on macOS the temp folder is under
+        // /var, which is a symlink to /private/var, and the guard returns the real path.
+        assert_eq!(path, fs::canonicalize(&ws).unwrap().join("new.txt"));
+    }
+
+    #[test]
+    fn write_allows_new_file_in_subfolder() {
+        let (_tmp, ws) = setup();
+        assert!(safe_write_path(&ws, "notes/new.md").is_ok());
+    }
+
+    #[test]
+    fn write_blocks_parent_dir() {
+        let (_tmp, ws) = setup();
+        let err = safe_write_path(&ws, "../hacked.txt").unwrap_err();
+        assert!(
+            err.contains("access denied: path is outside the workspace"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_blocks_sneaky_dotdot() {
+        let (_tmp, ws) = setup();
+        let err = safe_write_path(&ws, "notes/../../hacked.txt").unwrap_err();
+        assert!(
+            err.contains("access denied: path is outside the workspace"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_blocks_absolute_path() {
+        let (_tmp, ws) = setup();
+        let err = safe_write_path(&ws, "/tmp/hacked.txt").unwrap_err();
+        assert!(
+            err.contains("access denied: path is outside the workspace"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_rejects_empty_path() {
+        let (_tmp, ws) = setup();
+
+        let err = safe_write_path(&ws, "").unwrap_err();
+        assert!(
+            err.contains("is not a valid file path"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_rejects_dotdot() {
+        let (_tmp, ws) = setup();
+
+        let err = safe_write_path(&ws, "..").unwrap_err();
+        assert!(
+            err.contains("is not a valid file path"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_blocks_symlink() {
+        let (_tmp, ws) = setup();
+        let err = safe_write_path(&ws, "link.txt").unwrap_err();
+        assert!(
+            err.contains("access denied: 'link.txt' is a symlink"),
+            "wrong error: {err}"
+        );
+    }
+
+    // --- the tools themselves ---
+    #[test]
+    fn list_files_shows_files_and_marks_folders() {
+        let (_tmp, ws) = setup();
+        let result = tool_list_files(&ws).unwrap();
+        assert!(result.contains("todo.txt"), "got: {result}");
+        assert!(result.contains("notes/"), "folders should end with '/', got: {result}");
+    }
+
+    #[test]
+    fn read_file_returns_content() {
+        let (_tmp, ws) = setup();
+        let result = tool_read_file(&ws, &json!({"path": "todo.txt"}));
+        assert_eq!(result, Ok("buy milk".to_string()));
+    }
+
+    #[test]
+    fn write_does_nothing_when_user_denies() {
+        let (_tmp, ws) = setup();
+        let args = json!({"path": "todo.txt", "content": "hacked"});
+
+        // |_| false = a closure that ignores the question and always answers "no"
+        let err = tool_write_file(&ws, &args, |_| false).unwrap_err();
+
+        assert!(err.contains("denied"), "wrong error: {err}");
+        assert_eq!(fs::read_to_string(ws.join("todo.txt")).unwrap(), "buy milk");
+    }
+
+    #[test]
+    fn write_changes_file_when_user_allows() {
+        let (_tmp, ws) = setup();
+        let args = json!({"path": "todo.txt", "content": "buy milk\nbuy bread"});
+
+        let result = tool_write_file(&ws, &args, |_| true);
+
+        assert!(result.is_ok(), "got: {result:?}");
+        assert_eq!(
+            fs::read_to_string(ws.join("todo.txt")).unwrap(),
+            "buy milk\nbuy bread"
+        );
+    }
+
+    #[test]
+    fn write_attack_is_blocked_before_asking_user() {
+        let (_tmp, ws) = setup();
+        let args = json!({"path": "../secret.txt", "content": "hacked"});
+
+        // If the guard works, confirm is never called. If it IS called, this
+        // closure panics, and a panic makes the test fail.
+        let err = tool_write_file(&ws, &args, |_| panic!("confirm must not be called")).unwrap_err();
+
+        assert!(err.contains("access denied"), "wrong error: {err}");
+        let secret = fs::read_to_string(ws.parent().unwrap().join("secret.txt")).unwrap();
+        assert_eq!(secret, "TOP SECRET");
+    }
 }
